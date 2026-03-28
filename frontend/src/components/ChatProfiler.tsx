@@ -44,7 +44,8 @@ export default function ChatProfiler({ language, onProfileComplete }: ChatProfil
     setIsLoading(true);
 
     try {
-      const response = await sendChatMessage(newMessages, sessionId || undefined, language);
+      const apiMessages = newMessages.filter((_, idx) => idx > 0);
+      const response = await sendChatMessage(apiMessages, sessionId || undefined, language);
 
       setSessionId(response.session_id);
       setMessages([...newMessages, { role: "assistant", content: response.message }]);
