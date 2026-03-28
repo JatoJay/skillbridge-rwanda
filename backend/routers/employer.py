@@ -1,40 +1,87 @@
+import re
 from fastapi import APIRouter, HTTPException
 from models.job import EmployerJobPost, JobCreate, CandidateMatch
-from services.gemini_service import gemini_service
-from services.embedding_service import embedding_service
 from services.vector_search import vector_search_service
 from services.database import db
 
 router = APIRouter(prefix="/employer", tags=["employer"])
 
 
+def extract_skills_simple(description: str) -> list[str]:
+    common_skills = [
+        "Python", "JavaScript", "React", "Node.js", "SQL", "AWS", "Docker", "Kubernetes",
+        "Java", "TypeScript", "PostgreSQL", "MongoDB", "Git", "Linux", "Excel", "Tableau",
+        "Machine Learning", "Data Analysis", "Project Management", "Leadership", "Communication",
+        "Marketing", "SEO", "Sales", "Customer Service", "Accounting", "Finance", "HR",
+        "AutoCAD", "Figma", "Photoshop", "English", "French", "Kinyarwanda"
+    ]
+    found = []
+    desc_lower = description.lower()
+    for skill in common_skills:
+        if skill.lower() in desc_lower:
+            found.append(skill)
+    return found[:8] if found else ["Communication", "Problem Solving"]
+
+
+def extract_sector(description: str) -> str:
+    desc_lower = description.lower()
+    sectors = {
+        "ICT": ["software", "developer", "engineer", "tech", "IT", "data", "web", "mobile", "cloud"],
+        "Finance": ["bank", "financial", "accounting", "finance", "loan", "investment"],
+        "Healthcare": ["health", "medical", "hospital", "nurse", "doctor", "clinical"],
+        "Tourism": ["hotel", "tourism", "travel", "hospitality", "guide"],
+        "AgriTech": ["agriculture", "farm", "crop", "agri"],
+        "Construction": ["construction", "building", "architect", "civil"],
+        "Education": ["teacher", "school", "education", "training"],
+        "Manufacturing": ["manufacturing", "production", "factory"]
+    }
+    for sector, keywords in sectors.items():
+        if any(kw in desc_lower for kw in keywords):
+            return sector
+    return "General"
+
+
+def extract_title(description: str) -> str:
+    lines = description.strip().split('\n')
+    first_line = lines[0] if lines else description[:50]
+    if len(first_line) < 60:
+        return first_line.strip()
+    words = description.split()[:6]
+    return " ".join(words) + "..."
+
+
 @router.post("/jobs")
 async def create_job_posting(request: EmployerJobPost):
     try:
-        extracted = await gemini_service.extract_job_info(request.description)
+        skills = extract_skills_simple(request.description)
+        sector = extract_sector(request.description)
+        title = extract_title(request.description)
+
+        extracted = {
+            "title": title,
+            "required_skills": skills,
+            "preferred_skills": [],
+            "sector": sector,
+            "experience_level": "mid"
+        }
 
         job_data = {
-            "title": extracted.get("title", "Position"),
+            "title": title,
             "company": request.company,
             "description": request.description,
-            "required_skills": extracted.get("required_skills", []),
-            "preferred_skills": extracted.get("preferred_skills", []),
-            "experience_level": extracted.get("experience_level", "mid"),
-            "sector": extracted.get("sector", "ICT"),
+            "required_skills": skills,
+            "preferred_skills": [],
+            "experience_level": "mid",
+            "sector": sector,
             "location": request.location,
             "employment_type": "full-time",
             "contact_email": request.contact_email
         }
 
-        job_text = embedding_service.create_job_text(job_data)
-        embedding = await embedding_service.get_embedding(job_text)
-        job_data["embedding"] = embedding
-
         job_id = await db.create_job(job_data)
-        await vector_search_service.index_job(job_id, embedding)
 
         top_candidates = await vector_search_service.search_candidates_for_job(
-            embedding, top_k=3
+            [], top_k=3
         )
 
         matched_candidates = []
@@ -48,25 +95,16 @@ async def create_job_posting(request: EmployerJobPost):
                 required_skills = set(job_data["required_skills"])
                 matching = list(set(candidate_skills) & required_skills)
 
-                explanation = await gemini_service.generate_match_explanation(
-                    candidate.get("bio", ""),
-                    candidate_skills,
-                    job_data["title"],
-                    job_data["description"],
-                    score
-                )
-
                 matched_candidates.append({
                     "candidate_id": candidate_id,
                     "name": candidate.get("full_name", "Anonymous"),
                     "score": round(score * 100, 1),
                     "matching_skills": matching,
-                    "explanation": explanation
+                    "explanation": f"Candidate has relevant experience for this {sector} role."
                 })
 
         job_response = job_data.copy()
         job_response["id"] = job_id
-        job_response.pop("embedding", None)
 
         return {
             "job": job_response,
