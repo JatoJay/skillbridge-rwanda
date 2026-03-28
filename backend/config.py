@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     project_id: str = "skillbridge-rwanda"
     location: str = "us-central1"
 
-    gemini_model: str = "gemini-1.5-pro"
+    gemini_model: str = "gemini-1.5-flash-002"
     embedding_model: str = "text-embedding-004"
 
     vector_search_index_endpoint: str = ""
