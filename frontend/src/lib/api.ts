@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+const API_URL = 'https://skillbridge-backend-25390365712.us-central1.run.app';
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
