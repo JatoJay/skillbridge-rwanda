@@ -1,10 +1,12 @@
 import json
-from typing import Optional
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part, Content
+import os
+import httpx
 from config import get_settings
 
 settings = get_settings()
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 SYSTEM_PROMPT_PROFILER = """You are SkillBridge Rwanda's AI career assistant. Your role is to have a friendly conversation with job seekers in Rwanda to understand their professional background, skills, and career goals.
 
@@ -38,75 +40,60 @@ When you have gathered sufficient information, end your response with a JSON blo
 
 If more information is needed, respond naturally without the JSON block."""
 
-SYSTEM_PROMPT_GAP_ANALYSIS = """You are a career advisor for SkillBridge Rwanda. Analyze skill gaps between a candidate and a job requirement, then recommend specific Rwandan training programs.
+SYSTEM_PROMPT_JOB_EXTRACTION = """Extract structured information from this job description. Return ONLY valid JSON:
+{
+  "title": "job title",
+  "required_skills": ["skill1", "skill2"],
+  "preferred_skills": ["skill3"],
+  "sector": "one of: ICT, Finance, Healthcare, Tourism, AgriTech, Construction, Education, Manufacturing, Retail, Logistics",
+  "experience_level": "entry/mid/senior"
+}"""
 
-Available training providers in Rwanda:
-- TVET Colleges: Technical and vocational training across Rwanda
-- RDB (Rwanda Development Board): Business and entrepreneurship programs
-- ALX Africa: Software engineering, data science, and leadership programs
-- Andela: Software development training
-- University of Rwanda: Degree and certificate programs
-- CMU-Africa: Master's programs in IT and engineering
-- Digital Opportunity Trust: Digital skills training
-- Akilah Institute: Business and hospitality training for women
-
-Provide your response as JSON:
-```json
+SYSTEM_PROMPT_GAP_ANALYSIS = """Analyze skill gaps and recommend Rwandan training programs. Return ONLY valid JSON:
 {
   "missing_skills": ["skill1", "skill2"],
-  "gap_summary": "Clear explanation of the gaps",
+  "gap_summary": "explanation of gaps",
   "training_recommendations": [
-    {
-      "skill": "skill_name",
-      "provider": "provider_name",
-      "program": "specific program name",
-      "duration": "estimated duration",
-      "description": "brief description"
-    }
+    {"skill": "skill", "provider": "TVET/RDB/ALX/Andela/University of Rwanda/CMU-Africa", "program": "program name", "duration": "duration", "description": "brief description"}
   ]
-}
-```"""
+}"""
 
-SYSTEM_PROMPT_JOB_EXTRACTION = """You are a job posting analyzer for SkillBridge Rwanda. Extract structured information from job descriptions.
 
-Sectors to categorize into: AgriTech, Tourism, Construction, ICT, Finance, Healthcare, Education, Manufacturing, Retail, Logistics
+async def call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return ""
 
-Experience levels: entry, mid, senior
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
 
-Provide your response as JSON:
-```json
-{
-  "title": "extracted or inferred job title",
-  "required_skills": ["skill1", "skill2"],
-  "preferred_skills": ["skill3", "skill4"],
-  "sector": "one of the defined sectors",
-  "experience_level": "entry/mid/senior"
-}
-```"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}
+            }
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        return ""
 
 
 class GeminiService:
-    def __init__(self):
-        vertexai.init(project=settings.project_id, location=settings.location)
-        self.model = GenerativeModel(settings.gemini_model)
-
     async def chat_profile(self, messages: list[dict], language: str = "en") -> dict:
-        chat_history = []
-        for msg in messages[:-1]:
-            role = "user" if msg["role"] == "user" else "model"
-            chat_history.append(Content(role=role, parts=[Part.from_text(msg["content"])]))
+        if not GEMINI_API_KEY:
+            return {"message": "Please tell me about your skills and experience.", "profile_complete": False, "extracted_profile": None}
 
-        chat = self.model.start_chat(history=chat_history)
+        conversation = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+        lang_note = "Respond in Kinyarwanda." if language == "rw" else ""
 
-        lang_instruction = ""
-        if language == "rw":
-            lang_instruction = "\n\nRespond in Kinyarwanda."
+        prompt = f"{SYSTEM_PROMPT_PROFILER}\n\n{lang_note}\n\nConversation:\n{conversation}\n\nASSISTANT:"
 
-        response = chat.send_message(
-            f"{SYSTEM_PROMPT_PROFILER}{lang_instruction}\n\nUser: {messages[-1]['content']}"
-        )
+        response_text = await call_gemini(prompt)
 
-        response_text = response.text
+        if not response_text:
+            return {"message": "I'd love to learn more about you. What kind of work experience do you have?", "profile_complete": False, "extracted_profile": None}
+
         profile_complete = False
         extracted_profile = None
 
@@ -129,77 +116,58 @@ class GeminiService:
             "extracted_profile": extracted_profile
         }
 
-    async def analyze_skill_gap(
-        self,
-        candidate_skills: list[str],
-        required_skills: list[str],
-        job_title: str
-    ) -> dict:
+    async def analyze_skill_gap(self, candidate_skills: list[str], required_skills: list[str], job_title: str) -> dict:
+        if not GEMINI_API_KEY:
+            missing = list(set(required_skills) - set(candidate_skills))
+            return {"missing_skills": missing, "gap_summary": f"You need to develop: {', '.join(missing)}", "training_recommendations": []}
+
         prompt = f"""{SYSTEM_PROMPT_GAP_ANALYSIS}
 
 Job Title: {job_title}
 Candidate Skills: {', '.join(candidate_skills)}
-Required Skills: {', '.join(required_skills)}
+Required Skills: {', '.join(required_skills)}"""
 
-Analyze the gaps and provide training recommendations."""
-
-        response = self.model.generate_content(prompt)
+        response = await call_gemini(prompt)
 
         try:
-            json_start = response.text.find("```json") + 7
-            json_end = response.text.find("```", json_start)
-            json_str = response.text[json_start:json_end].strip()
-            return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            return {
-                "missing_skills": list(set(required_skills) - set(candidate_skills)),
-                "gap_summary": response.text,
-                "training_recommendations": []
-            }
+            if "```json" in response:
+                json_start = response.find("```json") + 7
+                json_end = response.find("```", json_start)
+                return json.loads(response[json_start:json_end].strip())
+            return json.loads(response)
+        except:
+            missing = list(set(required_skills) - set(candidate_skills))
+            return {"missing_skills": missing, "gap_summary": response or f"Skills to develop: {', '.join(missing)}", "training_recommendations": []}
 
     async def extract_job_info(self, description: str) -> dict:
-        prompt = f"""{SYSTEM_PROMPT_JOB_EXTRACTION}
+        if not GEMINI_API_KEY:
+            return {"title": "Position", "required_skills": [], "preferred_skills": [], "sector": "General", "experience_level": "mid"}
 
-Job Description:
-{description}
+        prompt = f"{SYSTEM_PROMPT_JOB_EXTRACTION}\n\nJob Description:\n{description}"
 
-Extract the structured job information."""
-
-        response = self.model.generate_content(prompt)
+        response = await call_gemini(prompt)
 
         try:
-            json_start = response.text.find("```json") + 7
-            json_end = response.text.find("```", json_start)
-            json_str = response.text[json_start:json_end].strip()
-            return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            return {
-                "title": "Unknown Position",
-                "required_skills": [],
-                "preferred_skills": [],
-                "sector": "ICT",
-                "experience_level": "mid"
-            }
+            if "```json" in response:
+                json_start = response.find("```json") + 7
+                json_end = response.find("```", json_start)
+                return json.loads(response[json_start:json_end].strip())
+            return json.loads(response)
+        except:
+            return {"title": "Position", "required_skills": [], "preferred_skills": [], "sector": "General", "experience_level": "mid"}
 
-    async def generate_match_explanation(
-        self,
-        candidate_bio: str,
-        candidate_skills: list[str],
-        job_title: str,
-        job_description: str,
-        match_score: float
-    ) -> str:
-        prompt = f"""Generate a brief, encouraging explanation (2-3 sentences) of why this candidate is a {match_score:.0%} match for this job.
+    async def generate_match_explanation(self, candidate_bio: str, candidate_skills: list[str], job_title: str, job_description: str, match_score: float) -> str:
+        if not GEMINI_API_KEY:
+            return f"Strong match based on your skills in {', '.join(candidate_skills[:3])}."
 
-Candidate Background: {candidate_bio}
-Candidate Skills: {', '.join(candidate_skills)}
-Job Title: {job_title}
-Job Description: {job_description}
+        prompt = f"""Generate a brief (2-3 sentences) explanation of why this candidate is a {match_score:.0%} match.
+Candidate: {candidate_bio}
+Skills: {', '.join(candidate_skills)}
+Job: {job_title}
+Description: {job_description[:200]}"""
 
-Be specific about matching skills and experience. Be encouraging but honest."""
-
-        response = self.model.generate_content(prompt)
-        return response.text.strip()
+        response = await call_gemini(prompt)
+        return response.strip() if response else f"Good match based on your {', '.join(candidate_skills[:3])} skills."
 
 
 gemini_service = GeminiService()
